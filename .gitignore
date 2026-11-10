@@ -15,6 +15,7 @@ triangle.wasm.map
 *.out
 build/
 dist/
+*.bak.*
 
 # ---- Emscripten cache / temp ----
 .emscripten_cache/
