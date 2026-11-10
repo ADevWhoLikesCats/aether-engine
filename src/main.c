@@ -19,7 +19,32 @@
 #include "bloom.h"
 #include "hdr_env.h"
 
+/* --- audio + physics (extern C) --- */
+extern void audio_init(void);
+extern void audio_play_bgm(const char* path);
+extern int  audio_is_ready(void);
+extern void physics_init(void);
+extern void physics_step(float dt);
+extern void physics_get_car_matrix(mat4* out);
+extern void physics_apply_impulse(float ix, float iy, float iz);
+extern void physics_set_downward_velocity(float v);
+extern void physics_drive(float throttle, float steer, float dt);
+
 #define CAR_PATH "/assets/car.glb"
+
+#ifndef FTRACE
+#define FTRACE(n) do { if (g_frame_index < 3) printf("[frame %d] step %s\n", g_frame_index, n); } while(0)
+#endif
+
+static float g_throttle = 0.0f;
+static float g_steer = 0.0f;
+
+static float g_cam_yaw = 0.0f;
+static float g_cam_pitch = 0.3f;
+static float g_cam_dist = 6.0f;
+static int   g_mouse_down = 0;
+static float g_mouse_x = 0.0f;
+static float g_mouse_y = 0.0f;
 
 static GLuint prog;
 static GLint  u_model, u_viewproj, u_normalmat;
@@ -158,9 +183,54 @@ static GLuint link(GLuint vs, GLuint fs) {
     return p;
 }
 
+
+static EM_BOOL on_mouse(int event_type, const EmscriptenMouseEvent* e, void* user) {
+    (void)user;
+    if (event_type == EMSCRIPTEN_EVENT_MOUSEDOWN && e->button == 2) {
+        g_mouse_down = 1;
+        g_mouse_x = (float)e->clientX;
+        g_mouse_y = (float)e->clientY;
+        return EM_TRUE;
+    }
+    if (event_type == EMSCRIPTEN_EVENT_MOUSEUP && e->button == 2) {
+        g_mouse_down = 0;
+        return EM_TRUE;
+    }
+    if (event_type == EMSCRIPTEN_EVENT_MOUSEMOVE && g_mouse_down) {
+        float dx = (float)e->clientX - g_mouse_x;
+        float dy = (float)e->clientY - g_mouse_y;
+        g_mouse_x = (float)e->clientX;
+        g_mouse_y = (float)e->clientY;
+        
+        g_cam_yaw   -= dx * 0.01f;
+        g_cam_pitch -= dy * 0.01f;
+        
+        // Clamp pitch so we don't flip upside down
+        if (g_cam_pitch >  1.4f) g_cam_pitch =  1.4f;
+        if (g_cam_pitch < -0.2f) g_cam_pitch = -0.2f;
+        return EM_TRUE;
+    }
+    // Prevent context menu on right click
+    if (event_type == EMSCRIPTEN_EVENT_CONTEXTMENU) return EM_TRUE;
+    return EM_FALSE;
+}
+
 static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* user) {
     (void)user;
+    
+    // 1. Handle WASD state for driving
+    int is_down = (event_type == EMSCRIPTEN_EVENT_KEYDOWN);
+    if (e->key[0] == 'w' || e->key[0] == 'W') g_throttle = is_down ? 1.0f : 0.0f;
+    if (e->key[0] == 's' || e->key[0] == 'S') g_throttle = is_down ? -1.0f : 0.0f;
+    if (e->key[0] == 'a' || e->key[0] == 'A') g_steer = is_down ? 1.0f : 0.0f;
+    if (e->key[0] == 'd' || e->key[0] == 'D') g_steer = is_down ? -1.0f : 0.0f;
+    
+    // 2. Audio init requires a keydown
+    if (is_down && !audio_is_ready()) audio_init();
+    
+    // 3. Ignore keyup for all other debug keys
     if (event_type != EMSCRIPTEN_EVENT_KEYDOWN) return EM_FALSE;
+    if (!audio_is_ready()) audio_init();
     if (e->key[0] == 'm' || e->key[0] == 'M') {
         g_debug_mode = (g_debug_mode + 1) % 16;
         printf("debug mode -> %d\n", g_debug_mode);
@@ -181,6 +251,7 @@ static EM_BOOL on_key(int event_type, const EmscriptenKeyboardEvent* e, void* us
         g_show_debug_overlays = !g_show_debug_overlays;
         printf("Debug overlays -> %s\n", g_show_debug_overlays ? "on" : "off");
     }
+
     if (e->key[0] == '-') {
         g_focus_distance -= 0.5f;
         if (g_focus_distance < 0.5f) g_focus_distance = 0.5f;
@@ -355,7 +426,35 @@ static void init(void) {
     /* Scale, then translate so the model's center is at origin */
     mat4 S = m4_scale(v3(scale, scale, scale));
     mat4 T = m4_translate(v3(-c.x * scale, -c.y * scale, -c.z * scale));
-    g_car_model = m4_mul(T, S);
+    
+    /* --- Align visual car bottom to physics body bottom --- */
+    // The physics box is 0.8 units tall (half-extent 0.4), spawned at y=0.4.
+    // Its visual "center" should be at y=0.4 in world space.
+    // The car's local min_bb.y is where the tires are.
+    // We want tires to touch y=0.
+    {
+        vec3 c2 = model_center(&g_car);
+        vec3 e2 = model_extent(&g_car);
+        float longest2 = e2.x; 
+        if (e2.y > longest2) longest2 = e2.y; 
+        if (e2.z > longest2) longest2 = e2.z;
+        float sc2 = (longest2 > 1e-6f) ? (3.0f / longest2) : 1.0f;
+        
+        // Car bottom in local scaled coords (relative to mesh center)
+        float car_bottom_local = (g_car.min_bb.y * sc2) - (c2.y * sc2);
+        
+        // Physics body center is at y=0.4. We want the visual bottom (car_bottom_local)
+        // to align with physics bottom (0.4 - 0.4 = 0.0).
+        // So the visual offset needed is: -(car_bottom_local)
+        float visual_y_offset = 0.0f; // Car naturally sits on ground via physics
+        
+        // Add this to the translate matrix T
+        mat4 lift = m4_translate(v3(0.0f, visual_y_offset, 0.0f));
+        g_car_model = m4_mul(lift, m4_mul(T, S));
+        
+        printf("Align: car_bottom_local=%.3f, lift=%.3f\\n", car_bottom_local, visual_y_offset);
+    }
+
 
     /* Apply the world transform to each mesh by baking it into the model matrix */
     for (int i = 0; i < g_car.count; ++i) {
@@ -363,7 +462,7 @@ static void init(void) {
     }
 
     /* Ground plane at the car's bottom Y */
-    float ground_y = g_car.min_bb.y * scale - c.y * scale - 0.02f;
+    float ground_y = 0.0f; // Ground aligns with physics floor
     g_ground = ground_create(ground_y, 15.0f);
     printf("=== before sky pass creation ===\n");
     for (int _k = 0; _k < 3; ++_k) {
@@ -402,8 +501,8 @@ static void init(void) {
 
         /* Apply the same world transform to each CPU triangle */
         int tri_n = g_mesh_cpu_tri_count;
-        float* world_tris = malloc(sizeof(float) * 9 * tri_n);
-        float* world_albs = malloc(sizeof(float) * 3 * tri_n);
+        float* world_tris = (float*)malloc(sizeof(float) * 9 * tri_n);
+        float* world_albs = (float*)malloc(sizeof(float) * 3 * tri_n);
         vec3 center = v3((bb_min.x + bb_max.x) * 0.5f,
                          (bb_min.y + bb_max.y) * 0.5f,
                          (bb_min.z + bb_max.z) * 0.5f);
@@ -470,8 +569,38 @@ static void init(void) {
         printf("[bake] SG bake pass: %.0f ms\n", emscripten_get_now() - _t_bake);
     }
 
+    FTRACE("sync_canvas_size");
     sync_canvas_size();
 
+    physics_init();
+
+    /* --- Calculate perfect drop velocity based on AABB --- */
+    {
+        float ground_y = 0.0f;
+        vec3 car_center = model_center(&g_car);
+        vec3 car_extent = model_extent(&g_car);
+        float longest = car_extent.x;
+        if (car_extent.y > longest) longest = car_extent.y;
+        if (car_extent.z > longest) longest = car_extent.z;
+        float scale = (longest > 1e-6f) ? (3.0f / longest) : 1.0f;
+        
+        float car_bottom_y = (g_car.min_bb.y * scale) - (car_center.y * scale);
+        float drop_height = car_bottom_y - ground_y;
+        
+        if (drop_height > 0.0f) {
+            float v = sqrtf(2.0f * 9.81f * drop_height);
+            physics_set_downward_velocity(v);
+            printf("physics: dropping car from %.2f units with velocity %.2f m/s\n", drop_height, v);
+        } else {
+            physics_set_downward_velocity(0.0f);
+        }
+    }
+
+    audio_play_bgm("/assets/bgm.ogg");
+    emscripten_set_mousedown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, on_mouse);
+    emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, on_mouse);
+    emscripten_set_mousemove_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, on_mouse);
+    emscripten_set_contextmenu_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, on_mouse);
     emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_TRUE, on_key);
     printf("Press M for debug modes. Press [ / ] to change roughness scale.\n");
 }
@@ -479,6 +608,7 @@ static void init(void) {
 static void draw_car_into_fb(int w, int h, vec3 cam) {
     vec3 target = v3(0.0f, 0.0f, 0.0f);
     vec3 up     = v3(0.0f, 1.0f, 0.0f);
+    { mat4 car_m; physics_get_car_matrix(&car_m); target = v3(car_m.m[12], car_m.m[13], car_m.m[14]); }
     mat4 view = m4_look_at(cam, target, up);
     mat4 proj = m4_perspective(50.0f * 3.14159265f / 180.0f,
                                (float)w / (float)h, 0.1f, 200.0f);
@@ -648,7 +778,7 @@ static void check_gl_errors(const char* label) {
 /* Depth histogram probe: measures the visible scene's world-space    */
 /* distance distribution. Used to pick SSGI raymarch parameters.      */
 /* ------------------------------------------------------------------ */
-static int g_probe_enabled = 1;
+static int g_probe_enabled = 0;
 
 static int cmp_float(const void* a, const void* b) {
     float fa = *(const float*)a;
@@ -683,7 +813,7 @@ static void probe_depth_stats(Framebuffer* fb, vec3 cam, mat4 inv_vp) {
     pass_set_i32(&g_depth_probe_pass, "uDepth", 0);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 
-    unsigned char* depth8 = malloc(sizeof(unsigned char) * w * h);
+    unsigned char* depth8 = (unsigned char*)malloc(sizeof(unsigned char) * w * h);
     if (!depth8) return;
     glReadPixels(0, 0, w, h, GL_RED, GL_UNSIGNED_BYTE, depth8);
 
@@ -696,7 +826,7 @@ static void probe_depth_stats(Framebuffer* fb, vec3 cam, mat4 inv_vp) {
     }
 
     int max_samples = (w / 8 + 1) * (h / 8 + 1);
-    float* dists = malloc(sizeof(float) * max_samples);
+    float* dists = (float*)malloc(sizeof(float) * max_samples);
     if (!dists) { free(depth8); return; }
 
     int n = 0;
@@ -788,19 +918,43 @@ static void frame(void) {
     sync_canvas_size();
 
     double t = emscripten_get_now() * 0.001;
-    /* Orbit camera */
-    float ang = (float)t * 0.3f;
-    vec3 cam = v3(sinf(ang) * 4.0f, 1.5f, cosf(ang) * 4.0f);
+    /* --- Third-person chase camera --- */
+    // 1. Get the car's current world position from physics
+    vec3 car_pos = v3(0, 0, 0);
+    {
+        extern void physics_get_car_matrix(mat4* out);
+        mat4 car_m; physics_get_car_matrix(&car_m);
+        car_pos = v3(car_m.m[12], car_m.m[13], car_m.m[14]);
+    }
+    
+    // 2. Calculate camera offset based on yaw/pitch
+    float cos_p = cosf(g_cam_pitch);
+    float sin_p = sinf(g_cam_pitch);
+    float cos_y = cosf(g_cam_yaw);
+    float sin_y = sinf(g_cam_yaw);
+    
+    float cam_off_x = g_cam_dist * cos_p * sin_y;
+    float cam_off_y = g_cam_dist * sin_p;
+    float cam_off_z = g_cam_dist * cos_p * cos_y;
+    
+    // 3. Lock camera X/Z to car X/Z (plus the offset), add Y offset
+    vec3 cam = v3(
+        car_pos.x + cam_off_x,
+        car_pos.y + cam_off_y + 0.5f, // 0.5f is a small lift so the camera isn't inside the car
+        car_pos.z + cam_off_z
+    );
     vec3 light_dir = v3_norm(v3(-0.4f, -1.0f, -0.5f));
     vec3 light_color = v3(1.0f, 0.98f, 0.95f);
     float light_intensity = 3.0f;
 
     /* Capture */
+    FTRACE("capture_run");
     capture_run(&g_capture,
                 v3(0.0f, 1.0f, 0.0f),
                 light_dir, light_color, light_intensity, cam);
 
     /* SH + SG */
+    FTRACE("sh_project");
     sh_project(&g_sh, &g_capture.fb);
     /*     sg_fit(&g_sg, &g_capture.fb); (disabled — replaced by tri_grid bake) */
 
@@ -827,8 +981,27 @@ static void frame(void) {
         /* Radius in world units after scaling ~3 units long => use fixed 3 */
         float radiusWorld = 3.0f;
         shadow_update_matrix(&g_shadow, centerWorld, radiusWorld, light_dir);
-        shadow_render(&g_shadow, g_car.meshes, g_car.count);
+        FTRACE("shadow_render");
+    shadow_render(&g_shadow, g_car.meshes, g_car.count);
     }
+    /* --- physics step + car matrix --- */
+    static double g_prev_t = 0.0;
+    double now_t = emscripten_get_now();
+    float dt = g_prev_t > 0.0 ? (float)((now_t - g_prev_t) * 0.001) : 0.0f;
+    if (dt > 0.1f) dt = 0.1f;
+    g_prev_t = now_t;
+    physics_drive(g_throttle, g_steer, dt);
+    physics_step(dt);
+    {
+        mat4 car_x;
+        physics_get_car_matrix(&car_x);
+        /* Preserve the existing auto-scale/center matrix by post-multiplying. */
+        for (int i = 0; i < g_car.count; ++i) {
+            g_car.meshes[i].model = m4_mul(car_x, g_car_model);
+        }
+    }
+
+    
 
     /* Scene -> G-buffer */
     fb_bind(&g_gbuffer[0]);
@@ -841,6 +1014,7 @@ static void frame(void) {
     glEnable(GL_CULL_FACE);
     glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    FTRACE("draw_car_into_fb");
     draw_car_into_fb(g_gbuffer[0].width, g_gbuffer[0].height, cam);
 
     /* Sky pass (AFTER scene, so the scene doesn't erase it) */
@@ -871,6 +1045,7 @@ static void frame(void) {
     }
     glActiveTexture(GL_TEXTURE0);
 
+    FTRACE("sky_pass");
     pass_use(&g_sky_pass);
     check_gl_errors("after pass_use");
         glActiveTexture(GL_TEXTURE0);
@@ -951,7 +1126,8 @@ static void frame(void) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_ssgi_pass);
+        FTRACE("ssgi_pass");
+    pass_use(&g_ssgi_pass);
         check_gl_errors("after ssgi pass_use");
 
         /* Inputs: this frame's scene color + depth, last frame's G-buffer. */
@@ -1122,7 +1298,8 @@ static void frame(void) {
         glClearColor(1, 1, 1, 1);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_ssao_pass);
+        FTRACE("ssao_pass");
+    pass_use(&g_ssao_pass);
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
         pass_set_i32(&g_ssao_pass, "uSceneDepth", 0);
@@ -1198,7 +1375,8 @@ static void frame(void) {
         glClearColor(0, 0, 0, 1);   /* a=1 means transmittance 1 (no fog) by default */
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_fog_raymarch_pass);
+        FTRACE("fog_raymarch");
+    pass_use(&g_fog_raymarch_pass);
 
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, g_scene_fb.depth);
@@ -1290,7 +1468,8 @@ static void frame(void) {
         glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_ssr_pass);
+        FTRACE("ssr_pass");
+    pass_use(&g_ssr_pass);
     check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
@@ -1361,7 +1540,8 @@ static void frame(void) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_ssr_composite_pass);
+        FTRACE("ssr_composite");
+    pass_use(&g_ssr_composite_pass);
     check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
@@ -1451,7 +1631,8 @@ static void frame(void) {
         glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_taa_pass);
+        FTRACE("taa_pass");
+    pass_use(&g_taa_pass);
     check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
@@ -1532,7 +1713,8 @@ static void frame(void) {
         glClearColor(0, 0, 0, 1);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        pass_use(&g_dof_pass);
+        FTRACE("dof_pass");
+    pass_use(&g_dof_pass);
     check_gl_errors("after pass_use");
 
         glActiveTexture(GL_TEXTURE0);
@@ -1598,7 +1780,8 @@ static void frame(void) {
 
     /* Bloom: bright pass + downsample + upsample chain */
     if (g_debug_mode != 12) if (g_debug_mode != 14) {
-        bloom_run(&g_bloom, final_hdr, 2.0f);
+        FTRACE("bloom_run");
+    bloom_run(&g_bloom, final_hdr, 2.0f);
     }  /* skip bloom in mode 12 */
 
     /* Ensure we're not still bound to a bloom mip when the composite samples it */
@@ -1637,6 +1820,7 @@ static void frame(void) {
     glClearColor(0.06f, 0.06f, 0.08f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
 
+    FTRACE("bloom_composite");
     pass_use(&g_bloom_composite_pass);
     check_gl_errors("after pass_use");
 

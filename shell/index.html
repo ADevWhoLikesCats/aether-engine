@@ -16,5 +16,11 @@
     };
   </script>
   {{{ SCRIPT }}}
+<script>
+document.addEventListener('click', function once() {
+    if (Module && Module._audio_init) Module._audio_init();
+    document.removeEventListener('click', once);
+}, { once: true });
+</script>
 </body>
 </html>

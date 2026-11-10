@@ -1,0 +1,120 @@
+/* src/physics.cpp - Bullet3 wrapper. Must be compiled as C++. */
+#include <btBulletDynamicsCommon.h>
+#include <stdio.h>
+#include <math.h>
+
+extern "C" {
+#include "math3d.h"
+}
+
+static btDiscreteDynamicsWorld* g_world = NULL;
+static btRigidBody* g_car = NULL;
+static btRigidBody* g_ground = NULL;
+static mat4 g_car_xform;
+
+static btRigidBody* make_box(btScalar hx, btScalar hy, btScalar hz,
+                             btScalar mass, const btVector3& pos) {
+    btBoxShape* shape = new btBoxShape(btVector3(hx, hy, hz));
+    btVector3 inertia(0,0,0);
+    if (mass > 0.0f) shape->calculateLocalInertia(mass, inertia);
+    btDefaultMotionState* ms = new btDefaultMotionState(
+        btTransform(btQuaternion(0,0,0,1), pos));
+    btRigidBody::btRigidBodyConstructionInfo ci(mass, ms, shape, inertia);
+    return new btRigidBody(ci);
+}
+
+extern "C" void physics_init(void) {
+    btDefaultCollisionConfiguration* cfg = new btDefaultCollisionConfiguration();
+    btCollisionDispatcher* disp = new btCollisionDispatcher(cfg);
+    btBroadphaseInterface* bp = new btDbvtBroadphase();
+    btSequentialImpulseConstraintSolver* solver = new btSequentialImpulseConstraintSolver();
+    g_world = new btDiscreteDynamicsWorld(disp, bp, solver, cfg);
+    g_world->setGravity(btVector3(0, -9.81f, 0));
+
+    // Car: low box; visuals handle the rest.
+    g_car = make_box(1.5f, 0.4f, 3.0f, 1.0f, btVector3(0, 0.0f, 0));
+    g_car->setDamping(0.5f, 0.9f);
+    g_car->setFriction(1.0f);
+    g_world->addRigidBody(g_car);
+
+    // Ground: huge flat box so nothing falls forever.
+    g_ground = make_box(100.0f, 0.5f, 100.0f, 0.0f, btVector3(0, -0.5f, 0));
+    g_world->addRigidBody(g_ground);
+
+    g_car_xform = m4_identity();
+    printf("physics: Bullet3 world ready\n");
+}
+
+extern "C" void physics_step(float dt) {
+    if (!g_world) return;
+    g_world->stepSimulation(dt, 8, 1.0f/60.0f);
+}
+
+extern "C" void physics_get_car_matrix(mat4* out) {
+    if (!g_car || !out) return;
+    btTransform t;
+    g_car->getMotionState()->getWorldTransform(t);
+    btVector3 p = t.getOrigin();
+    btQuaternion q = t.getRotation();
+
+    float x = q.x(), y = q.y(), z = q.z(), w = q.w();
+    float xx = x*x, yy = y*y, zz = z*z;
+    float xy = x*y, xz = x*z, yz = y*z;
+    float wx = w*x, wy = w*y, wz = w*z;
+
+    out->m[0]  = 1 - 2*(yy + zz);
+    out->m[1]  = 2*(xy + wz);
+    out->m[2]  = 2*(xz - wy);
+    out->m[3]  = 0;
+    out->m[4]  = 2*(xy - wz);
+    out->m[5]  = 1 - 2*(xx + zz);
+    out->m[6]  = 2*(yz + wx);
+    out->m[7]  = 0;
+    out->m[8]  = 2*(xz + wy);
+    out->m[9]  = 2*(yz - wx);
+    out->m[10] = 1 - 2*(xx + yy);
+    out->m[11] = 0;
+    out->m[12] = p.x(); out->m[13] = p.y(); out->m[14] = p.z(); out->m[15] = 1;
+}
+
+extern "C" void physics_apply_impulse(float ix, float iy, float iz) {
+    if (!g_car) return;
+    g_car->activate();
+    g_car->applyCentralImpulse(btVector3(ix, iy, iz));
+}
+
+extern "C" void physics_shutdown(void) {
+    delete g_world; g_world = NULL; g_car = NULL; g_ground = NULL;
+}
+
+extern "C" void physics_set_downward_velocity(float v) {
+    if (!g_car) return;
+    g_car->activate();
+    g_car->setLinearVelocity(btVector3(0.0f, -v, 0.0f));
+}
+
+extern "C" void physics_drive(float throttle, float steer, float dt) {
+    if (!g_car) return;
+    g_car->activate();
+    
+    // Get current forward direction (local -Z axis in Bullet)
+    btMatrix3x3 basis = g_car->getWorldTransform().getBasis();
+    btVector3 forward = basis.getColumn(2);
+    forward = -forward; // Drive towards -Z
+    forward.setY(0);    // Flatten so we don't drive into the sky
+    forward.normalize();
+    
+    // Apply Engine Force (Throttle)
+    float engine_power = 35000.0f; 
+    btVector3 force = forward * (throttle * engine_power * dt);
+    g_car->applyCentralForce(force);
+    
+    // Apply Steering (Yaw Torque)
+    float steer_power = 25000.0f; 
+    // Only steer if we are actually moving (speed > 0.5)
+    if (g_car->getLinearVelocity().length() > 0.5f) {
+        btVector3 up(0.0f, 1.0f, 0.0f);
+        btVector3 torque = up * (steer * steer_power * dt);
+        g_car->applyTorque(torque);
+    }
+}

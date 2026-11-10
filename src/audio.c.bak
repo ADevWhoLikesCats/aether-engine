@@ -1,0 +1,59 @@
+/* src/audio.c - miniaudio wrapper. Single translation unit. */
+#define MINIAUDIO_IMPLEMENTATION
+#include "miniaudio.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+static ma_engine g_engine;
+static int g_audio_initialized = 0;
+static ma_sound* g_bgm = NULL;
+
+void audio_init(void) {
+    if (g_audio_initialized) return;
+    ma_result r = ma_engine_init(NULL, &g_engine);
+    if (r != MA_SUCCESS) {
+        fprintf(stderr, "audio: ma_engine_init failed (%d)\n", r);
+        return;
+    }
+    g_audio_initialized = 1;
+    printf("audio: engine ready\n");
+}
+
+int audio_is_ready(void) { return g_audio_initialized; }
+
+void audio_play(const char* path, int loop) {
+    if (!g_audio_initialized) { audio_init(); }
+    if (!g_audio_initialized) return;
+    ma_sound* s = (ma_sound*)calloc(1, sizeof(ma_sound));
+    if (ma_sound_init_from_file(&g_engine, path, 0, NULL, NULL, s) != MA_SUCCESS) {
+        fprintf(stderr, "audio: cannot load %s\n", path);
+        free(s); return;
+    }
+    s->pUserData = (void*)0x1; /* leak marker; caller owns looped sounds */
+    ma_sound_set_looping(s, loop ? MA_TRUE : MA_FALSE);
+    ma_sound_start(s);
+}
+
+void audio_play_bgm(const char* path) {
+    if (!g_audio_initialized) audio_init();
+    if (!g_audio_initialized) return;
+    if (g_bgm) { ma_sound_stop(g_bgm); ma_sound_uninit(g_bgm); free(g_bgm); g_bgm = NULL; }
+    g_bgm = (ma_sound*)calloc(1, sizeof(ma_sound));
+    if (ma_sound_init_from_file(&g_engine, path, 0, NULL, NULL, g_bgm) != MA_SUCCESS) {
+        fprintf(stderr, "audio: cannot load bgm %s\n", path);
+        free(g_bgm); g_bgm = NULL; return;
+    }
+    ma_sound_set_looping(g_bgm, MA_TRUE);
+    ma_sound_start(g_bgm);
+}
+
+void audio_stop_all(void) {
+    if (!g_audio_initialized) return;
+    if (g_bgm) { ma_sound_stop(g_bgm); }
+    ma_engine_stop(&g_engine);
+}
+
+void audio_shutdown(void) {
+    if (g_bgm) { ma_sound_stop(g_bgm); ma_sound_uninit(g_bgm); free(g_bgm); g_bgm = NULL; }
+    if (g_audio_initialized) { ma_engine_uninit(&g_engine); g_audio_initialized = 0; }
+}

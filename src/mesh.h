@@ -41,11 +41,18 @@ typedef struct {
 } Mesh;
 
 typedef struct {
+    mat4 local_transform;
+    Mesh mesh;
+} Wheel;
+
+typedef struct {
     Mesh*   meshes;
     int     count;
     /* Bounding info for auto-scaling */
     vec3    min_bb;
     vec3    max_bb;
+    Wheel   wheels[4];
+    int     wheel_count;
 } Model;
 
 /* Load a .glb file from the virtual FS path. */

@@ -189,6 +189,30 @@ Model model_load_glb(const char* path) {
     printf("  meshes=%zu materials=%zu images=%zu nodes=%zu\n",
            data->meshes_count, data->materials_count, data->images_count, data->nodes_count);
 
+    /* --- Pre-scan for wheel nodes --- */
+    int wheel_mesh_to_slot[1024];
+    for (int i = 0; i < 1024; i++) wheel_mesh_to_slot[i] = -1;
+    for (size_t ni = 0; ni < data->nodes_count; ++ni) {
+        cgltf_node* node = &data->nodes[ni];
+        if (!node->name || !node->mesh) continue;
+        int slot = -1;
+        if (strcmp(node->name, "Wheel_FL") == 0) slot = 0;
+        if (strcmp(node->name, "Wheel_FR") == 0) slot = 1;
+        if (strcmp(node->name, "Wheel_RL") == 0) slot = 2;
+        if (strcmp(node->name, "Wheel_RR") == 0) slot = 3;
+        if (slot >= 0) {
+            int mi = (int)(node->mesh - data->meshes);
+            if (mi < 1024) wheel_mesh_to_slot[mi] = slot;
+            // Save local transform
+            cgltf_float world_mat[16];
+            cgltf_node_transform_world(node, world_mat);
+            memcpy(model.wheels[slot].local_transform.m, world_mat, sizeof(float)*16);
+            printf("  Wheel slot %d mapped to mesh %d\n", slot, mi);
+        }
+    }
+    model.wheel_count = 4;
+
+
     /* Count primitives */
     size_t total_prims = 0;
     for (size_t i = 0; i < data->meshes_count; ++i) {
@@ -247,6 +271,100 @@ Model model_load_glb(const char* path) {
 
     for (size_t mi = 0; mi < data->meshes_count; ++mi) {
         cgltf_mesh* gm = &data->meshes[mi];
+
+        // --- Wheel Standalone Processing ---
+        int wheel_slot = (mi < 1024) ? wheel_mesh_to_slot[mi] : -1;
+        if (wheel_slot >= 0) {
+            // Collect all primitives into a temporary Mesh
+            // We'll build it directly here.
+            Mesh* out = &model.wheels[wheel_slot].mesh;
+            out->material = default_material(); // placeholder
+            out->model = m4_identity();
+            
+            // Count total verts/indices for this wheel
+            size_t total_verts = 0, total_indices = 0;
+            for (size_t pi = 0; pi < gm->primitives_count; ++pi) {
+                cgltf_primitive* prim = &gm->primitives[pi];
+                cgltf_accessor* a_pos = NULL;
+                for (size_t ai = 0; ai < prim->attributes_count; ++ai) {
+                    if (prim->attributes[ai].type == cgltf_attribute_type_position) {
+                        a_pos = prim->attributes[ai].data;
+                        break;
+                    }
+                }
+                if (a_pos) total_verts += a_pos->count;
+                total_indices += prim->indices ? prim->indices->count : (a_pos ? a_pos->count : 0);
+            }
+            
+            // Allocate temp buffers
+            float* verts = malloc(sizeof(float) * 12 * total_verts);
+            unsigned int* indices = malloc(sizeof(unsigned int) * total_indices);
+            size_t v_off = 0, i_off = 0;
+            
+            for (size_t pi = 0; pi < gm->primitives_count; ++pi) {
+                cgltf_primitive* prim = &gm->primitives[pi];
+                cgltf_accessor *a_pos = NULL, *a_nrm = NULL, *a_uv = NULL;
+                for (size_t ai = 0; ai < prim->attributes_count; ++ai) {
+                    if (prim->attributes[ai].type == cgltf_attribute_type_position) a_pos = prim->attributes[ai].data;
+                    if (prim->attributes[ai].type == cgltf_attribute_type_normal) a_nrm = prim->attributes[ai].data;
+                    if (prim->attributes[ai].type == cgltf_attribute_type_texcoord) a_uv = prim->attributes[ai].data;
+                }
+                if (!a_pos) continue;
+                size_t vcount = a_pos->count;
+                float* pos = accessor_to_float(a_pos, 3);
+                float* nrm = a_nrm ? accessor_to_float(a_nrm, 3) : NULL;
+                float* uv = a_uv ? accessor_to_float(a_uv, 2) : NULL;
+                
+                for (size_t v = 0; v < vcount; ++v) {
+                    float* dst = verts + (v_off + v) * 12;
+                    dst[0]=pos[v*3+0]; dst[1]=pos[v*3+1]; dst[2]=pos[v*3+2];
+                    if (nrm) { dst[3]=nrm[v*3+0]; dst[4]=nrm[v*3+1]; dst[5]=nrm[v*3+2]; }
+                    else { dst[3]=0; dst[4]=1; dst[5]=0; }
+                    if (uv) { dst[6]=uv[v*2+0]; dst[7]=uv[v*2+1]; }
+                    else { dst[6]=0; dst[7]=0; }
+                    dst[8]=1; dst[9]=0; dst[10]=0; dst[11]=1; // tangent
+                }
+                
+                size_t icount = prim->indices ? prim->indices->count : vcount;
+                for (size_t i = 0; i < icount; ++i) {
+                    unsigned int idx = prim->indices ? (unsigned int)cgltf_accessor_read_index(prim->indices, i) : (unsigned int)i;
+                    indices[i_off + i] = idx + (unsigned int)v_off;
+                }
+                v_off += vcount;
+                i_off += icount;
+                free(pos); free(nrm); free(uv);
+            }
+            
+            // Create VAO/VBO/EBO
+            glGenVertexArrays(1, &out->vao);
+            glBindVertexArray(out->vao);
+            glGenBuffers(1, &out->vbo);
+            glBindBuffer(GL_ARRAY_BUFFER, out->vbo);
+            glBufferData(GL_ARRAY_BUFFER, sizeof(float) * 12 * v_off, verts, GL_STATIC_DRAW);
+            
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12*sizeof(float), (void*)0);
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 12*sizeof(float), (void*)(3*sizeof(float)));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 12*sizeof(float), (void*)(6*sizeof(float)));
+            glEnableVertexAttribArray(3);
+            glVertexAttribPointer(3, 4, GL_FLOAT, GL_FALSE, 12*sizeof(float), (void*)(8*sizeof(float)));
+            
+            glGenBuffers(1, &out->ebo);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, out->ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned int) * i_off, indices, GL_STATIC_DRAW);
+            
+            out->index_count = (GLuint)i_off;
+            glBindVertexArray(0);
+            
+            printf("  Built wheel slot %d: %zu verts, %zu indices\n", wheel_slot, v_off, i_off);
+            
+            free(verts);
+            free(indices);
+            continue; // Skip the merge for this mesh
+        }
+
         for (size_t pi = 0; pi < gm->primitives_count; ++pi) {
             cgltf_primitive* prim = &gm->primitives[pi];
             if (prim->type != cgltf_primitive_type_triangles) continue;
